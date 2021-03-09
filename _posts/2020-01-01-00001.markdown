@@ -1,0 +1,75 @@
+---
+title: 一次线上线程池过载导致的性能劣化问题定位
+date: 2020-01-01 13:32:20 +0800
+categories: [问题定位]
+tags: [Java, Concurrent]
+author: 四火
+comments: true
+---
+
+## 问题现象
+
+今日线上机器，发现CPU长时间使用率超高，通过jstack定位到具体执行线程，发现大量XXX线程一直在后台执行。分析日志，发现有大量task加入线程池的日志打印，但是线程并未得到执行，导致积压大量task，而执行效率不高。
+
+## 问题定位
+
+受限定位到执行缓慢的代码处：
+```java
+    ExecutorService XML_PARSE_EXECUTOR_SERVICE = Executors.newFixedThreadPool(100);
+    ExecutorService.execute(Runnable);
+```
+
+newFixedThreadPool的Java实现逻辑是：
+```java
+    public static ExecutorService newFixedThreadPool(int nThreads) {
+        return new ThreadPoolExecutor(nThreads, nThreads,
+                                      0L, TimeUnit.MILLISECONDS,
+                                      new LinkedBlockingQueue<Runnable>());
+    }
+```
+
+LinkedBlockingQueue的默认构造器的实现逻辑是：
+```java
+    public LinkedBlockingQueue() {
+        this(Integer.MAX_VALUE);
+    }
+```
+所以这意味着，我们通过ExecutorService的execute往里添加task时，如果已经超过了maximumPoolSize，这时候task就会进入LinkedBlockingQueue队列等待执行，这是一个无界队列，一直往里面加的话，可能会导致资源问题。
+
+## 解决思路
+
+ThreadPoolExecutor的maximumPoolSize与queue满了后，主线程通过execute/submit添加新任务时能阻塞，而不是使用RejectedExecutionHandler。
+
+## 方案实现
+
+通过Semaphore实现限流：
+```java
+public class BoundedExecutor {
+    private final Executor exec;
+    private final Semaphore semaphore;
+
+    public BoundedExecutor(Executor exec, int bound) {
+        this.exec = exec;
+        this.semaphore = new Semaphore(bound);
+    }
+
+    public void submitTask(final Runnable command)
+            throws InterruptedException, RejectedExecutionException {
+        semaphore.acquire();
+        try {
+            exec.execute(new Runnable() {
+                public void run() {
+                    try {
+                        command.run();
+                    } finally {
+                        semaphore.release();
+                    }
+                }
+            });
+        } catch (RejectedExecutionException e) {
+            semaphore.release();
+            throw e;
+        }
+    }
+}
+```
