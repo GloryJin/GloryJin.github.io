@@ -29,7 +29,22 @@ init() {
   fi
 }
 
+replacePowerBy() {
+	for file in `ls $1`
+	do
+		if [ -d $1"/"$file ]
+		then
+			replacePowerBy $1"/"$file
+		else
+			if [ "$file" = "index.html" ];then
+				sed -i 's/<div class="footer-right"><p class="mb-0"> Powered by <a href="https:\/\/jekyllrb.com" target="_blank" rel="noopener">Jekyll<\/a> with <a href="https:\/\/github.com\/cotes2020\/jekyll-theme-chirpy" target="_blank" rel="noopener">Chirpy<\/a> theme.<\/p><\/div>//g' $1"/"$file 
+			fi
+		fi
+	done
+}
+
 backup() {
+  replacePowerBy "_site"
   mv _site/* "$_backup_dir"
   mv .git "$_backup_dir"
 
@@ -39,6 +54,7 @@ backup() {
     mv CNAME "$_backup_dir"
   fi
 }
+
 
 flush() {
   rm -rf ./*
