@@ -1,0 +1,23 @@
+---
+layout: post
+title: Flink源码解析系列---RPC框架
+date: 2021-03-19 13:32:20 +0300
+description: 基于flink1.12.0版本源码
+img: 
+tags: [Flink, Rpc, Akka]
+author: eric
+---
+
+RPC调用, 消息基本接口定义
+{% highlight java %}
+public interface RpcInvocation {
+    // 方法名称
+    String getMethodName() throws IOException, ClassNotFoundException;
+    // 参数类型
+    Class<?>[] getParameterTypes() throws IOException, ClassNotFoundException;
+    // 参数
+    Object[] getArgs() throws IOException, ClassNotFoundException;
+}
+{% endhighlight %}
+
+![pic1]({{ "/flink/flink0001.png" | prepend: site.picurl }})
