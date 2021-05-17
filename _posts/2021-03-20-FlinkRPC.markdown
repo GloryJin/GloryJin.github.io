@@ -8,7 +8,143 @@ tags: [Flink, Rpc, Akka]
 author: eric
 ---
 
-RPC调用, 消息基本接口定义
+
+# 前言
+对于Flink中多个组件基于Rpc实现通信，其底层RPC通信框架基于Akka实现，本文着重分析Flink中的Rpc框架实现机制及梳理其通信流程。
+
+# Akka介绍
+由于Flink底层Rpc是基于Akka实现，我们先了解下Akka的基本使用。
+
+Akka是一个开发并发、容错和可伸缩应用的框架。它是Actor Model的一个实现，和Erlang的并发模型很像。在Actor模型中，所有的实体被认为是独立的actors。actors和其他actors通过发送异步消息通信。Actor模型的强大来自于异步。它也可以显式等待响应，这使得可以执行同步操作。但是，强烈不建议同步消息，因为它们限制了系统的伸缩性。每个actor有一个邮箱(mailbox)，它收到的消息存储在里面。另外，每一个actor维护自身单独的状态。一个Actors网络如下所示：
+
+## 2.1 AkkaRpcActor
+
+AkkaRpcActor， 首先确定一点，它是一个actor，那既然是一个actor，则它最重要的一个函数，就是定义Receive的处理方法拉，用于消息的处理。
+{% highlight java %}
+@Override
+public Receive createReceive() {
+	return ReceiveBuilder.create()
+			.match(RemoteHandshakeMessage.class, this::handleHandshakeMessage)
+			.match(ControlMessages.class, this::handleControlMessage)
+			.matchAny(this::handleMessage)
+			.build();
+}
+{% endhighlight %}
+上面就是定义了几种消息的处理：
+- 握手消息
+- 控制消息(start/stop/TERMINATE)
+- rpc调用消息
+
+RpcEndpoint对应一个路径（由endpointId和actorSystem共同确定）
+
+
+
+所以AkkaInvocationHandler需要与AkkaRpcActor配合使用，AkkaRpcActor负责处理消息，而AkkaInvocationHandler负责把相应的消息往AkkaRpcActor发。
+
+
+#### RpcService
+官方的说明：
+{% highlight java %}
+/**
+ * Interface for rpc services. An rpc service is used to start and connect to a RpcEndpoint. 
+ * Connecting to a rpc server will return a RpcGateway which can be used to call remote procedures.
+ */
+{% endhighlight %}
+其实说白了，就是用来管理RpcEndpoint的。
+核心的接口方法如下：
+- <C extends RpcGateway> CompletableFuture<C> connect(String address, Class<C> clazz);  // 根据地址连接到远程的一个RpcEndpoint，并返回一个RpcGateway
+- <C extends RpcEndpoint & RpcGateway> RpcServer startServer(C rpcEndpoint); // 根据提供的RpcEndpoint来启动RpcServer（Actor）
+- void stopServer(RpcServer selfGateway); // 停止RpcServer（Actor）
+- CompletableFuture<Void> stopService(); // 停止自身服务
+
+#### AkkaRpcService
+RpcService接口当前的唯一实现，所以才说，当前Flink是基于Akka的RPC通信机制。
+唯一的绑定于一个ActorSystem，可以理解为分布式系统里一个节点，对应一个ActorSystem。
+核心功能如下：
+![pic3]({{ "/flink/flink0003.png" | prepend: site.picurl }})
+
+
+Flink的Rpc框架有提供AkkaRpcServiceUtils工具集，用来创建AkkaRpcService。
+{% highlight java %}
+public static AkkaRpcService createRemoteRpcService(
+            Configuration configuration,
+            @Nullable String externalAddress,
+            String externalPortRange,
+            @Nullable String bindAddress,
+            @SuppressWarnings("OptionalUsedAsFieldOrParameterType") Optional<Integer> bindPort)
+            throws Exception {
+        final AkkaRpcServiceBuilder akkaRpcServiceBuilder =
+                AkkaRpcServiceUtils.remoteServiceBuilder(
+                        configuration, externalAddress, externalPortRange);
+
+        if (bindAddress != null) {
+            akkaRpcServiceBuilder.withBindAddress(bindAddress);
+        }
+
+        bindPort.ifPresent(akkaRpcServiceBuilder::withBindPort);
+
+        return akkaRpcServiceBuilder.createAndStart();
+    }
+}
+
+public AkkaRpcService createAndStart() throws Exception {
+	if (actorSystemExecutorConfiguration == null) {
+		actorSystemExecutorConfiguration =
+				BootstrapTools.ForkJoinExecutorConfiguration.fromConfiguration(
+						configuration);
+	}
+    // 核心，其实就是要创建出当前节点的ActorSystem
+	final ActorSystem actorSystem;
+
+	if (externalAddress == null) {
+		// create local actor system
+		actorSystem =
+				BootstrapTools.startLocalActorSystem(
+						configuration,
+						actorSystemName,
+						logger,
+						actorSystemExecutorConfiguration,
+						customConfig);
+	} else {
+		// create remote actor system
+		actorSystem =
+				BootstrapTools.startRemoteActorSystem(
+						configuration,
+						actorSystemName,
+						externalAddress,
+						externalPortRange,
+						bindAddress,
+						Optional.ofNullable(bindPort),
+						logger,
+						actorSystemExecutorConfiguration,
+						customConfig);
+	}
+
+	return new AkkaRpcService(
+			actorSystem, AkkaRpcServiceConfiguration.fromConfiguration(configuration));
+}
+{% endhighlight %}
+
+
+#### RpcServer
+
+其实，它就是一个通过动态代理，生成的一个代理对象
+
+
+
+
+
+
+
+
+
+AkkaRpcService先startServer()获得一个代理对象RpcServer，然后通过代理对象invoke(), 底层调的是AkkaInvocationHandler的invoke，往actor发RpcInvocation消息，调到AkkaRpcActor的createReceive方法，
+然后在此方法里，实际去通过反射，调用到实际对应的方法。
+
+
+
+#### RpcInvocation
+代表RPC协议定义，即client与server端之间通信的消息定义：
 {% highlight java %}
 public interface RpcInvocation {
     // 方法名称
@@ -21,3 +157,128 @@ public interface RpcInvocation {
 {% endhighlight %}
 
 ![pic1]({{ "/flink/flink0001.png" | prepend: site.picurl }})
+
+如上图，它有2个子类，LocalRpcInvocation和RemoteRpcInvocation，分别用于表示本地rpc调用和远程rpc调用协议，两者的区别是，前者不需要序列化，后者需要序列化。
+
+
+#### AkkaInvocationHandler
+代表基于Akka框架的RPC客户端定义，用于与server端通信传送RpcInvocation实现rpc的调用。
+我们先来解剖下这个类，看看里面都有啥。
+![pic2]({{ "/flink/flink0002.png" | prepend: site.picurl }})
+
+比较重要的属性就是isLocal和rpcEndponit。
+- isLocal：用于标识rpcEndpoint对应的actor是本地，还是远端
+- rpcEndpoint：用于标识通信组件所对应的actor的actorRef
+
+比较重要的方法就是invoke.
+- invoke: 用于方法调用，首先根据参数（方法名、方法参数、方法参数类型）构造一个RpcInvocation对象，然后通过rpcEndpoint发送RpcInvocation消息出去。
+
+而其它几个runAsync(Runnable runnable)、scheduleRunAsync(Runnable runnable, long delayMillis)等等，注意，这只支持本地actor，在本地直接指向代码逻辑。
+
+
+#### RpcEndpoint
+代表RPC服务端的定义，需要基于RPC框架提供服务的生产者，都需要扩展此类。 
+其主要提供的是，服务端的启动等功能。
+
+{% highlight java %}
+/**
+ * Initializes the RPC endpoint.
+ *
+ * @param rpcService The RPC server that dispatches calls to this RPC endpoint.
+ * @param endpointId Unique identifier for this endpoint
+ */
+protected RpcEndpoint(final RpcService rpcService, final String endpointId) {
+	this.rpcService = checkNotNull(rpcService, "rpcService");
+	this.endpointId = checkNotNull(endpointId, "endpointId");
+    // 这里是关键的初始化
+	this.rpcServer = rpcService.startServer(this);
+
+	this.mainThreadExecutor = new MainThreadExecutor(rpcServer, this::validateRunsInMainThread);
+}
+{% endhighlight %}
+
+
+其实每个需要通信的节点，在启动的时候，在初始化的时候就都创建好了，所谓的启动RpcServer，其实只是给actor的状态设置一下而已。
+
+
+
+
+
+1、对于分布式的节点（每个进程），需要先创建一个actorSystem，因为后续的actor都依赖此actorSyste来创建。
+2、每个actorSystem需要创建一个Supervisor, 即监控actor，用于管理每个节点所有actor的生命周期。
+3、每个要对外提供rpc接口的模块(类)，
+    3.1、首先，定义一个对应业务的gatwway接口(比如TaskExecutor的TaskExecutorGateway)，提供对外暴露的接口。
+	3.2、实现业务的类，必须继承RpcEndpinit类。
+4、使用rpc接口。
+以JobMaster调用TaskExecutor的方法为例来说明下：
+{% highlight java %}
+return getRpcService()    // 获取RpcService
+		.connect(taskManagerRpcAddress, TaskExecutorGateway.class)   // 调用connect方法
+		.handleAsync(
+				(TaskExecutorGateway taskExecutorGateway, Throwable throwable) -> {    // TaskExecutorGateway即TaskExecutor的代理对象
+					if (throwable != null) {
+						return new RegistrationResponse.Decline(throwable.getMessage());
+					}
+
+					slotPool.registerTaskManager(taskManagerId);
+					registeredTaskManagers.put(
+							taskManagerId,
+							Tuple2.of(taskManagerLocation, taskExecutorGateway));
+
+					// monitor the task manager as heartbeat target
+					taskManagerHeartbeatManager.monitorTarget(
+							taskManagerId,
+							new HeartbeatTarget<AllocatedSlotReport>() {
+								@Override
+								public void receiveHeartbeat(
+										ResourceID resourceID,
+										AllocatedSlotReport payload) {
+									// the task manager will not request heartbeat, so
+									// this method will never be called currently
+								}
+
+								@Override
+								public void requestHeartbeat(
+										ResourceID resourceID,
+										AllocatedSlotReport allocatedSlotReport) {
+									taskExecutorGateway.heartbeatFromJobManager(    // 直接调用TaskExecutor的rpc方法
+											resourceID, allocatedSlotReport);
+								}
+							});
+
+					return new JMTMRegistrationSuccess(resourceId);
+				},
+				getMainThreadExecutor());
+{% endhighlight %}
+
+
+connect方法底层的核心代码如下：
+{% highlight java %}
+return actorRefFuture.thenCombineAsync(
+		handshakeFuture,
+		(ActorRef actorRef, HandshakeSuccessMessage ignored) -> {
+			InvocationHandler invocationHandler = invocationHandlerFactory.apply(actorRef);
+
+			// Rather than using the System ClassLoader directly, we derive the ClassLoader
+			// from this class . That works better in cases where Flink runs embedded and
+			// all Flink
+			// code is loaded dynamically (for example from an OSGI bundle) through a custom
+			// ClassLoader
+			ClassLoader classLoader = getClass().getClassLoader();
+
+			@SuppressWarnings("unchecked")
+			C proxy =
+					(C)
+							Proxy.newProxyInstance(
+									classLoader, new Class<?>[] {clazz}, invocationHandler);
+
+			return proxy;
+		},
+		actorSystem.dispatcher());
+{% endhighlight %}
+即通过动态代理的方式，获取clazz类的代理对象。底层通过封装有actorRef的invocationHandler进行rpc调用消息的传递。
+
+
+
+
+[RPC框架基本知识教程](https://www.bilibili.com/video/av73288542?p=2&spm_id_from=pageDriver)
